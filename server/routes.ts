@@ -81,7 +81,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
               console.log(`Created error results for ${data.url}. Will attempt to generate diagnostic report.`);
             }
           }
-                    // Generate the PDF report
+
+          // Generate the PDF report
           let reportPath;
           try {
             reportPath = await generateReport(data.url, results);

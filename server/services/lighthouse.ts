@@ -1,28 +1,23 @@
-/**
- * Simplified Lighthouse integration using the CLI approach
- * This is more reliable in restricted environments like Replit
- */
-import { exec } from 'child_process';
+import * as lighthouse from 'lighthouse';
+import * as chromeLauncher from 'chrome-launcher';
 import * as fs from 'fs';
 import * as path from 'path';
-import { promisify } from 'util';
+import * as util from 'util';
 import PDFDocument from 'pdfkit';
 import { Writable } from 'stream';
 import { mkdir } from 'fs/promises';
-
-const execPromise = promisify(exec);
 
 // Interface for scan results
 export interface LighthouseScanResult {
   url: string;
   scanDateTime: string;
   error?: string;
-  reportPath?: string;
-  reportJson?: any;
+  results?: any; // Raw lighthouse results
+  reportUrl?: string;
 }
 
 /**
- * Run a Lighthouse scan on the specified URL using the CLI
+ * Run a Lighthouse scan on the specified URL
  * 
  * @param url URL to scan
  * @returns Promise with the scan result
@@ -33,44 +28,34 @@ export async function runLighthouseScan(url: string): Promise<LighthouseScanResu
     url = 'https://' + url;
   }
 
-  console.log(`Starting Lighthouse CLI scan for: ${url}`);
+  console.log(`Starting Lighthouse scan for: ${url}`);
   
   try {
-    // Create directory for temporary files
-    const tempDir = path.join(process.cwd(), 'reports', 'temp');
-    await mkdir(tempDir, { recursive: true });
+    // Launch Chrome
+    const chrome = await chromeLauncher.launch({
+      chromeFlags: ['--headless', '--disable-gpu', '--no-sandbox']
+    });
     
-    // Define output paths
-    const timestamp = Date.now();
-    const jsonOutputPath = path.join(tempDir, `lighthouse_${timestamp}.json`);
+    // Run Lighthouse
+    const options = {
+      logLevel: 'info' as 'info',
+      output: 'json',
+      onlyCategories: ['accessibility'],
+      port: chrome.port,
+    };
     
-    // Run Lighthouse CLI
-    const cmd = `npx lighthouse "${url}" --output=json --output-path="${jsonOutputPath}" --chrome-flags="--headless --disable-gpu --no-sandbox" --only-categories=accessibility --quiet`;
+    console.log('Chrome launched, starting Lighthouse scan...');
+    const results = await lighthouse(url, options);
     
-    console.log(`Executing Lighthouse CLI: ${cmd}`);
-    const { stdout, stderr } = await execPromise(cmd);
-    
-    if (stderr && !stderr.includes('DevTools listening')) {
-      console.error('Lighthouse CLI stderr:', stderr);
-    }
-    
-    // Check if JSON file was created
-    if (!fs.existsSync(jsonOutputPath)) {
-      throw new Error('Lighthouse scan failed to produce JSON output');
-    }
-    
-    // Read and parse the JSON result
-    const jsonResult = JSON.parse(fs.readFileSync(jsonOutputPath, 'utf8'));
+    // Close Chrome
+    await chrome.kill();
     
     console.log('Lighthouse scan completed successfully');
-    
-    // Clean up temporary file
-    fs.unlinkSync(jsonOutputPath);
-    
+
     return {
       url,
       scanDateTime: new Date().toISOString(),
-      reportJson: jsonResult
+      results: results.lhr,
     };
   } catch (error) {
     console.error('Lighthouse scan error:', error);
@@ -97,7 +82,17 @@ export async function generateLighthouseReport(scanResult: LighthouseScanResult)
   const reportPath = path.join(reportsDir, `lighthouse_scan_${Date.now()}.pdf`);
   const doc = new PDFDocument({ margin: 50, size: 'A4' });
   
+  // Use a writable stream to create the PDF
+  const chunks: Buffer[] = [];
+  const stream = new Writable({
+    write(chunk, encoding, callback) {
+      chunks.push(Buffer.from(chunk));
+      callback();
+    }
+  });
+  
   doc.pipe(fs.createWriteStream(reportPath));
+  doc.pipe(stream);
   
   // Helper functions for consistent styling
   const addHeading = (text: string, options = {}) => {
@@ -174,12 +169,11 @@ export async function generateLighthouseReport(scanResult: LighthouseScanResult)
     doc.addPage();
     addHeading('Executive Summary', { align: 'left' });
     
-    if (scanResult.reportJson) {
-      const results = scanResult.reportJson;
-      const accessibilityScore = Math.round(results.categories.accessibility.score * 100);
+    if (scanResult.results) {
+      const accessibilityScore = Math.round(scanResult.results.categories.accessibility.score * 100);
       const accessibilityColor = accessibilityScore >= 90 ? '#10B981' : // Green
-                               accessibilityScore >= 70 ? '#F59E0B' : // Amber 
-                                                      '#EF4444';   // Red
+                                 accessibilityScore >= 70 ? '#F59E0B' : // Amber 
+                                                        '#EF4444';   // Red
         
       doc.fontSize(14)
          .fillColor(accessibilityColor)
@@ -203,27 +197,25 @@ export async function generateLighthouseReport(scanResult: LighthouseScanResult)
          
       doc.moveDown();
       
-      // Get audits for accessibility category
-      const auditRefs = results.categories.accessibility.auditRefs || [];
+      // Summary of issues
+      const allAudits = scanResult.results.categories.accessibility.auditRefs;
+      const failedAudits = allAudits
+        .filter(ref => {
+          const audit = scanResult.results.audits[ref.id];
+          return audit.score !== null && audit.score < 1;
+        })
+        .map(ref => scanResult.results.audits[ref.id]);
       
-      // Count failing audits
-      const failingAudits = auditRefs
-        .map(ref => ({ 
-          id: ref.id, 
-          ...results.audits[ref.id] 
-        }))
-        .filter(audit => audit.score !== null && audit.score < 1);
-      
-      addParagraph(`Total issues detected: ${failingAudits.length}`);
+      addParagraph(`Total issues detected: ${failedAudits.length}`);
       
       // If we have issues, show overall recommendations
-      if (failingAudits.length > 0) {
+      if (failedAudits.length > 0) {
         doc.moveDown();
         addSubheading('Key Recommendations');
         
         // Group failed audits by group
-        const auditsByGroup: Record<string, any[]> = {};
-        failingAudits.forEach(audit => {
+        const auditsByGroup = {};
+        failedAudits.forEach(audit => {
           const group = audit.group || 'other';
           if (!auditsByGroup[group]) {
             auditsByGroup[group] = [];
@@ -240,7 +232,7 @@ export async function generateLighthouseReport(scanResult: LighthouseScanResult)
                .text(`${groupName} Issues: ${audits.length}`, { continued: false });
                
             // Show top 3 issues from this group
-            audits.slice(0, 3).forEach(audit => {
+            (audits as any[]).slice(0, 3).forEach(audit => {
               doc.fontSize(12)
                  .fillColor('#4B5563')
                  .text(`• ${audit.title}`, { 
@@ -267,112 +259,125 @@ export async function generateLighthouseReport(scanResult: LighthouseScanResult)
       doc.addPage();
       addHeading('Detailed Findings', { align: 'left' });
       
-      if (failingAudits.length === 0) {
+      if (failedAudits.length === 0) {
         addParagraph('No accessibility issues were found. Congratulations!');
       } else {
-        // Sort audits by score (lower score = more severe)
-        const sortedAudits = [...failingAudits].sort((a, b) => {
-          if (a.score === null) return -1;
-          if (b.score === null) return 1;
-          return a.score - b.score;
+        // Group audits by impact
+        const impactOrder = ['critical', 'serious', 'moderate', 'minor'];
+        const auditsByImpact = {
+          critical: [],
+          serious: [],
+          moderate: [],
+          minor: []
+        };
+        
+        // Map Lighthouse scores to impact levels
+        failedAudits.forEach(audit => {
+          if (audit.score === 0) {
+            auditsByImpact.critical.push(audit);
+          } else if (audit.score <= 0.33) {
+            auditsByImpact.serious.push(audit);
+          } else if (audit.score <= 0.66) {
+            auditsByImpact.moderate.push(audit);
+          } else {
+            auditsByImpact.minor.push(audit);
+          }
         });
         
-        // Display the issues
-        sortedAudits.forEach((audit, index) => {
-          // Get severity
-          let severity = 'minor';
-          let severityColor = '#6B7280';
-          
-          if (audit.score === null || audit.score === 0) {
-            severity = 'critical';
-            severityColor = '#DC2626';
-          } else if (audit.score <= 0.33) {
-            severity = 'serious';
-            severityColor = '#DC2626';
-          } else if (audit.score <= 0.66) {
-            severity = 'moderate';
-            severityColor = '#F59E0B';
-          }
-          
-          // Issue title
-          doc.fontSize(14)
-             .fillColor(severityColor)
-             .text(`${index + 1}. ${audit.title} (${severity})`, { continued: false });
-          
-          // Issue description
-          doc.moveDown(0.5);
-          doc.fontSize(12)
-             .fillColor('#4B5563')
-             .text(audit.description);
-          
-          // Failure details if available
-          if (audit.details && audit.details.items && audit.details.items.length > 0) {
-            doc.moveDown(0.5);
-            doc.fontSize(12)
-               .fillColor('#000000')
-               .text('Examples:');
+        // Display each impact group
+        impactOrder.forEach(impact => {
+          const audits = auditsByImpact[impact];
+          if (audits.length > 0) {
+            doc.moveDown();
+            doc.fontSize(16)
+               .fillColor(impact === 'critical' || impact === 'serious' ? '#DC2626' : 
+                         impact === 'moderate' ? '#F59E0B' : '#6B7280')
+               .text(`${impact.charAt(0).toUpperCase() + impact.slice(1)} Impact Issues`, 
+                 { underline: true });
+            doc.moveDown();
             
-            // Show up to 3 examples
-            audit.details.items.slice(0, 3).forEach((item: any, itemIndex: number) => {
-              let itemText = '';
+            // List each audit in this impact group
+            audits.forEach((audit, index) => {
+              // Issue title
+              doc.fontSize(14)
+                 .fillColor('#000000')
+                 .text(`${index + 1}. ${audit.title}`);
               
-              // Format varies by audit type
-              if (item.node) {
-                itemText = `Element: ${item.node.selector || item.node}`;
-              } else if (item.selector) {
-                itemText = `Element: ${item.selector}`;
-              } else if (item.element) {
-                itemText = `Element: ${item.element}`;
-              } else {
-                // Create a string representation of whatever properties are available
-                itemText = Object.entries(item)
-                  .slice(0, 3) // Limit to first 3 properties to avoid excessive text
-                  .map(([key, value]) => `${key}: ${value}`)
-                  .join(', ');
+              // Issue description
+              doc.moveDown(0.5);
+              doc.fontSize(12)
+                 .fillColor('#4B5563')
+                 .text(audit.description);
+              
+              // Failure details if available
+              if (audit.details && audit.details.items && audit.details.items.length > 0) {
+                doc.moveDown(0.5);
+                doc.fontSize(12)
+                   .fillColor('#000000')
+                   .text('Examples:');
+                
+                // Show up to 3 examples
+                audit.details.items.slice(0, 3).forEach((item, itemIndex) => {
+                  let itemText = '';
+                  
+                  // Format varies by audit type
+                  if (item.node && item.node.selector) {
+                    itemText = `Element: ${item.node.selector}`;
+                  } else if (item.selector) {
+                    itemText = `Element: ${item.selector}`;
+                  } else if (item.element) {
+                    itemText = `Element: ${item.element}`;
+                  } else {
+                    // Create a string representation of whatever properties are available
+                    itemText = Object.entries(item)
+                      .map(([key, value]) => `${key}: ${value}`)
+                      .join(', ');
+                  }
+                  
+                  doc.fontSize(11)
+                     .fillColor('#4B5563')
+                     .text(`Example ${itemIndex + 1}: ${itemText}`, { indent: 20 });
+                });
+                
+                // Note if there are more examples
+                if (audit.details.items.length > 3) {
+                  doc.fontSize(10)
+                     .fillColor('#6B7280')
+                     .text(`...and ${audit.details.items.length - 3} more examples.`, { indent: 20 });
+                }
               }
               
-              doc.fontSize(11)
+              // How to fix
+              doc.moveDown(0.5);
+              doc.fontSize(12)
+                 .fillColor('#000000')
+                 .text('How to fix:');
+              
+              doc.fontSize(12)
                  .fillColor('#4B5563')
-                 .text(`Example ${itemIndex + 1}: ${itemText}`, { indent: 20 });
+                 .text(audit.helpText || 'Follow WCAG guidelines to address this issue.', { indent: 20 });
+              
+              doc.moveDown(1);
             });
-            
-            // Note if there are more examples
-            if (audit.details.items.length > 3) {
-              doc.fontSize(10)
-                 .fillColor('#6B7280')
-                 .text(`...and ${audit.details.items.length - 3} more examples.`, { indent: 20 });
-            }
           }
-          
-          // How to fix
-          doc.moveDown(0.5);
-          doc.fontSize(12)
-             .fillColor('#000000')
-             .text('How to fix:');
-          
-          doc.fontSize(12)
-             .fillColor('#4B5563')
-             .text(audit.helpText || 'Follow WCAG guidelines to address this issue.', { indent: 20 });
-          
-          doc.moveDown(1);
         });
       }
       
       // Passing tests section
-      const passingAudits = auditRefs
-        .map(ref => ({ 
-          id: ref.id, 
-          ...results.audits[ref.id] 
-        }))
-        .filter(audit => audit.score === 1);
+      const passingAudits = allAudits
+        .filter(ref => {
+          const audit = scanResult.results.audits[ref.id];
+          return audit.score === 1;
+        })
+        .map(ref => scanResult.results.audits[ref.id]);
       
       if (passingAudits.length > 0) {
         doc.addPage();
         addHeading('Passing Accessibility Tests', { align: 'left' });
-        addParagraph(`Your website successfully passed ${passingAudits.length} accessibility tests.`);
+        addParagraph(`Your website successfully passed ${passingAudits.length} accessibility tests, including:`);
         
         // Group passing audits by group
-        const passingByGroup: Record<string, any[]> = {};
+        const passingByGroup = {};
         passingAudits.forEach(audit => {
           const group = audit.group || 'other';
           if (!passingByGroup[group]) {

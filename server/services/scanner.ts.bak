@@ -87,10 +87,7 @@ interface ScanResult {
   violations: any[];
   passes: any[];
   incomplete: any[];
-  screenshot?: string; // Base64 encoded screenshot (deprecated)
-  error?: string;      // Error message if scan failed
-  scanDateTime?: string; // ISO timestamp of when scan was performed
-  url?: string;        // URL that was scanned
+  screenshot?: string; // Base64 encoded screenshot
 }
 
 // Fallback function to generate a basic report when the scan fails
@@ -310,10 +307,9 @@ export async function scanWebsite(url: string): Promise<ScanResult> {
     console.log('Scanning real website:', url);
     
     // Try multiple approaches to fetch the website
-    let htmlContent = '';
+    let htmlContent;
     let fetchAttempts = 0;
-    const maxFetchAttempts = 5; // Increased retry attempts
-    let lastError = '';
+    const maxFetchAttempts = 3;
     
     while (fetchAttempts < maxFetchAttempts) {
       try {
@@ -322,103 +318,41 @@ export async function scanWebsite(url: string): Promise<ScanResult> {
         // Add cache-busting parameter to avoid cached responses
         const fetchUrl = `${url}${url.includes('?') ? '&' : '?'}_cb=${Date.now()}`;
         
-        // Use different fetch options on each attempt with varying user agents
-        const userAgents = [
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36',
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Safari/605.1.15',
-          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.75 Safari/537.36',
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.51 Safari/537.36 Edg/99.0.1150.30',
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:98.0) Gecko/20100101 Firefox/98.0'
-        ];
-        
+        // Use different fetch options on each attempt
         const fetchOptions = {
           headers: {
-            'User-Agent': userAgents[fetchAttempts % userAgents.length],
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache'
           },
-          timeout: 20000, // Increased timeout
-          follow: 10,     // Increased redirect follows
+          timeout: 15000, // 15 seconds timeout
+          follow: 5,      // Follow up to 5 redirects
         };
-        
-        console.log(`Using User-Agent: ${fetchOptions.headers['User-Agent']}`);
         
         const response = await fetch(fetchUrl, fetchOptions);
         
-        // Handle different HTTP statuses
         if (!response.ok) {
-          const statusText = `HTTP error! Status: ${response.status} ${response.statusText}`;
-          console.error(statusText);
-          
-          // Special handling for specific status codes
-          if (response.status === 403) {
-            // Try to get content even with 403 status
-            const forbiddenContent = await response.text();
-            if (forbiddenContent && forbiddenContent.length > 1000) {
-              console.log('Got content despite 403 status, will attempt to process it');
-              htmlContent = forbiddenContent;
-              break;
-            }
-            throw new Error(`Access forbidden (403) - The website may be blocking our requests`);
-          } else if (response.status === 429) {
-            throw new Error('Rate limited (429) - Too many requests to the website');
-          } else {
-            throw new Error(statusText);
-          }
+          throw new Error(`HTTP error! Status: ${response.status}`);
         }
         
         htmlContent = await response.text();
         
         if (htmlContent && htmlContent.length > 0) {
           console.log(`Successfully fetched ${url} (${htmlContent.length} bytes)`);
-          
-          // Check if we actually got HTML and not some other response like JSON
-          if (!htmlContent.includes('<html') && !htmlContent.includes('<body')) {
-            const contentPreview = htmlContent.substring(0, 200);
-            console.warn(`Warning: Response may not be HTML: ${contentPreview}...`);
-            
-            // If it looks like JSON, try to extract a meaningful error message
-            if (contentPreview.includes('{') && contentPreview.includes('}')) {
-              try {
-                const jsonResponse = JSON.parse(htmlContent);
-                console.log('Received JSON response:', jsonResponse);
-                if (jsonResponse.error) {
-                  throw new Error(`API error: ${jsonResponse.error}`);
-                }
-              } catch (jsonError) {
-                // Not valid JSON or no error property
-              }
-            }
-            
-            // If HTML tags are not found but content is substantial, we'll try to continue
-            if (htmlContent.length > 5000) {
-              console.log('Content is substantial, will attempt to process it');
-              break;
-            }
-            
-            throw new Error('Received response does not appear to be HTML');
-          }
-          
           break; // Success, exit the loop
         } else {
           throw new Error('Received empty response');
         }
       } catch (fetchError) {
         fetchAttempts++;
-        const errorMessage = fetchError instanceof Error ? fetchError.message : String(fetchError);
-        lastError = errorMessage;
-        console.error(`Fetch attempt ${fetchAttempts} failed:`, errorMessage);
+        console.error(`Fetch attempt ${fetchAttempts} failed:`, fetchError);
         
         if (fetchAttempts >= maxFetchAttempts) {
-          throw new Error(`Failed to fetch ${url} after ${maxFetchAttempts} attempts: ${lastError}`);
+          throw new Error(`Failed to fetch ${url} after ${maxFetchAttempts} attempts: ${fetchError.message}`);
         }
         
-        // Progressively longer waits between retries
-        const waitTime = 2000 * fetchAttempts;
-        console.log(`Waiting ${waitTime}ms before retry...`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
+        // Wait before retrying
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
     }
     
@@ -428,50 +362,16 @@ export async function scanWebsite(url: string): Promise<ScanResult> {
     // Create a virtual DOM with the fetched content
     let dom;
     try {
-      // First attempt basic sanitization if needed
-      if (htmlContent.includes('<script') || htmlContent.includes('<iframe')) {
-        console.log('Content contains scripts or iframes, applying basic sanitization');
-        // Basic sanitization to prevent common issues
-        htmlContent = htmlContent
-          .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '') // Remove script tags
-          .replace(/<iframe\b[^<]*(?:(?!<\/iframe>)<[^<]*)*<\/iframe>/gi, '') // Remove iframe tags
-          .replace(/<link[^>]*>/gi, ''); // Remove external resource links
-      }
-      
-      // Try to ensure we have a proper HTML structure
-      if (!htmlContent.includes('<html')) {
-        console.log('Adding HTML wrapper to content');
-        htmlContent = `<!DOCTYPE html><html><head><title>Scanned Page</title></head><body>${htmlContent}</body></html>`;
-      }
-      
       dom = new JSDOM(htmlContent, {
         url: url, // Use the actual URL for relative paths
         runScripts: "outside-only", // Don't run scripts for safety
         resources: "usable", // Allow loading resources
         pretendToBeVisual: true // This helps with some visual-specific tests
       });
-      
-      // Basic validation that we have a usable DOM
-      if (!dom.window.document.body) {
-        throw new Error('Created DOM does not have a body element');
-      }
     } catch (error) {
       console.error('Error creating JSDOM:', error);
-      
-      // Try a more minimal approach as fallback
-      try {
-        console.log('Attempting fallback minimal DOM creation');
-        dom = new JSDOM(`<!DOCTYPE html><html><head><title>Fallback</title></head><body>
-          <div id="content">${htmlContent}</div>
-        </body></html>`, {
-          url: url,
-          runScripts: "outside-only"
-        });
-      } catch (fallbackError) {
-        console.error('Fallback DOM creation also failed:', fallbackError);
-        throw new Error('Failed to parse website HTML: ' + 
-          (error instanceof Error ? error.message : String(error)));
-      }
+      throw new Error('Failed to parse website HTML: ' + 
+        (error instanceof Error ? error.message : String(error)));
     }
 
     const { window } = dom;
@@ -521,29 +421,23 @@ export async function scanWebsite(url: string): Promise<ScanResult> {
       // First make sure we have a valid scan result
       const scanResult = await scanResultPromise;
       
-      // We'll skip the screenshot functionality completely
-      // This is because Replit's environment often blocks headless browser functionality
-      console.log('Skipping screenshot capture, using enhanced text descriptions instead');
+      // Then try to get the screenshot, but don't fail if we can't
+      let screenshot: string | null = null;
+      try {
+        screenshot = await screenshotPromise;
+      } catch (screenshotError) {
+        console.warn('Screenshot capture failed but continuing with scan:', screenshotError);
+        // Continue without screenshot
+      }
       
-      // Return scan result with metadata about the scan
+      // Return the combined result
       return {
         ...scanResult,
-        scanDateTime: new Date().toISOString(),
-        url: url
+        screenshot: screenshot || undefined
       };
     } catch (scanError) {
       console.error('Scan failed:', scanError);
-      
-      // Instead of throwing an error, return a partial result with error information
-      // This allows us to still generate a report with details about what went wrong
-      return {
-        violations: [],
-        passes: [],
-        incomplete: [],
-        error: scanError instanceof Error ? scanError.message : String(scanError),
-        scanDateTime: new Date().toISOString(),
-        url: url
-      };
+      throw new Error('Accessibility scan failed: ' + (scanError instanceof Error ? scanError.message : String(scanError)));
     }
     
     // This code is never reached, but kept for reference
@@ -632,55 +526,47 @@ export async function generateReport(url: string, results: ScanResult): Promise<
     doc.fontSize(12)
        .fillColor('#6B7280')
        .text(`Scan Date: ${new Date().toLocaleString()}`, { align: 'center' });
-       
-    // If we have an error, display it prominently
-    if (results.error) {
-      doc.moveDown(1);
-      doc.fontSize(14)
-         .fillColor('#DC2626')
-         .text('Scanning Error Detected', { align: 'center' });
-      
-      doc.moveDown(0.5);
-      doc.fontSize(12)
-         .fillColor('#DC2626')
-         .text(`We encountered an issue while scanning this website: ${results.error}`, { 
-           align: 'center',
-           width: 400
-         });
-         
-      doc.moveDown(0.5);
-      doc.fontSize(12)
-         .fillColor('#6B7280')
-         .text('The website may have restrictions that prevent automated scanning, or there might be network connectivity issues. The report will contain limited information.', { 
-           align: 'center',
-           width: 400
-         });
+    
+    // Add website screenshot if available
+    if (results.screenshot) {
+      try {
+        doc.moveDown(1);
+        
+        // Center the screenshot with some margin
+        const pageWidth = doc.page.width - 100; // 50px margin on each side
+        const height = 300; // Fixed height for consistency
+        
+        // We'll skip the screenshot if it causes errors
+        if (results.screenshot && results.screenshot.startsWith('data:image/')) {
+          // The screenshot is already a data URL
+          doc.image(results.screenshot, {
+            fit: [pageWidth, height],
+            align: 'center',
+            valign: 'center'
+          });
+        } else if (results.screenshot) {
+          // Just raw base64 data
+          try {
+            doc.image(`data:image/png;base64,${results.screenshot}`, {
+              fit: [pageWidth, height],
+              align: 'center',
+              valign: 'center'
+            });
+          } catch (err) {
+            console.log('Could not parse screenshot as PNG, skipping');
+          }
+        }
+        
+        // Add caption
+        doc.moveDown(0.5);
+        doc.fontSize(10)
+           .fillColor('#6B7280')
+           .text('Website Screenshot', { align: 'center' });
+           
+      } catch (screenshotError) {
+        console.error('Error adding screenshot to PDF:', screenshotError);
+      }
     }
-    
-    // Add page information section instead of screenshots
-    doc.moveDown(1);
-    doc.fontSize(14)
-       .fillColor('#000000')
-       .text('Scan Information', { align: 'left' });
-    
-    doc.moveDown(0.5);
-    doc.fontSize(12)
-       .fillColor('#333333')
-       .text(`• URL: ${url}`, { align: 'left' });
-    
-    doc.fontSize(12)
-       .fillColor('#333333')
-       .text(`• Scan Date: ${new Date().toLocaleString()}`, { align: 'left' });
-    
-    doc.fontSize(12)
-       .fillColor('#333333')
-       .text(`• Total Issues Found: ${results.violations.length}`, { align: 'left' });
-    
-    doc.fontSize(12)
-       .fillColor('#333333')
-       .text(`• Standards Tested: WCAG 2.1 A, AA, and Best Practices`, { align: 'left' });
-    
-    doc.moveDown(0.5);
     
     doc.moveDown(2);
     
@@ -721,50 +607,7 @@ export async function generateReport(url: string, results: ScanResult): Promise<
   doc.addPage();
   addHeading('Executive Summary', { align: 'left' });
   
-  // Check if we have an error
-  if (results.error) {
-    // Show error information in the report
-    doc.fontSize(14)
-       .fillColor('#DC2626')
-       .text('Scan Limitations', { underline: true });
-    
-    doc.moveDown(0.5);
-    doc.fontSize(12)
-       .fillColor('#4B5563')
-       .text(`We encountered the following issue while attempting to scan ${url}:`);
-    
-    doc.moveDown(0.5);
-    doc.fontSize(12)
-       .fillColor('#DC2626')
-       .text(results.error, { indent: 20 });
-    
-    doc.moveDown(1);
-    doc.fontSize(12)
-       .fillColor('#4B5563')
-       .text(`This may be due to one or more of the following reasons:
-1. The website blocks automated scanning tools
-2. Network connectivity issues or firewalls
-3. The website has CORS restrictions that prevent content access
-4. The website requires authentication before content can be accessed
-5. The content is loaded dynamically after the initial HTML is loaded`);
-    
-    doc.moveDown(1);
-    doc.fontSize(14)
-       .fillColor('#000000')
-       .text('Recommendations');
-    
-    doc.moveDown(0.5);
-    doc.fontSize(12)
-       .fillColor('#4B5563')
-       .text(`• Consider scanning the website in a different environment with fewer network restrictions
-• Try scanning the website after authenticating (if applicable)
-• Perform a manual accessibility audit to supplement automated testing
-• Contact the website administrator to request permission for automated scanning`);
-    
-    return; // Skip the regular metrics display
-  }
-  
-  // Calculate compliance metrics for normal scan results
+  // Calculate compliance metrics
   const totalIssues = results.violations.length;
   const criticalIssues = results.violations.filter(v => v.impact === 'critical' || v.impact === 'serious').length;
   const moderateIssues = results.violations.filter(v => v.impact === 'moderate').length;
@@ -858,83 +701,20 @@ export async function generateReport(url: string, results: ScanResult): Promise<
            .fillColor('#4B5563')
            .text(violation.helpUrl, { indent: 20, link: violation.helpUrl });
         
-        // Enhanced location details with more context
+        // If nodes are available, show a specific example
         if (violation.nodes && violation.nodes.length > 0) {
-          doc.moveDown(0.5);
-          doc.fontSize(12)
-             .fillColor('#000000')
-             .text('Location Details:');
-          
-          // Loop through up to 3 examples with detailed location information
-          violation.nodes.slice(0, 3).forEach((node, nodeIndex) => {
-            doc.moveDown(0.25);
-            
-            // Extract location information - selector path shows where in the DOM
-            const selector = node.target ? node.target.join(' > ') : 'Unknown location';
-            const htmlSnippet = node.html || 'No HTML available';
-            
-            // Try to extract any available extra data like colors, dimensions, etc.
-            let extraData = '';
-            
-            if (node.any) {
-              // Look for color contrast information
-              const colorCheck = node.any.find(check => check.id === 'color-contrast');
-              if (colorCheck && colorCheck.data) {
-                extraData += `Color contrast: ${colorCheck.data.contrastRatio || 'unknown'} ratio `;
-                if (colorCheck.data.fgColor) {
-                  extraData += `(foreground: ${colorCheck.data.fgColor}, `;
-                }
-                if (colorCheck.data.bgColor) {
-                  extraData += `background: ${colorCheck.data.bgColor}) `;
-                }
-              }
-              
-              // Extract any other useful data
-              node.any.forEach(check => {
-                if (check.data && !extraData.includes(check.id)) {
-                  if (check.data.attributes) {
-                    extraData += `Attributes: ${JSON.stringify(check.data.attributes)} `;
-                  }
-                  if (check.data.nodeName) {
-                    extraData += `Element type: ${check.data.nodeName} `;
-                  }
-                }
-              });
-            }
-            
-            doc.fontSize(11)
+          const node = violation.nodes[0];
+          if (node.html) {
+            doc.moveDown(0.5);
+            doc.fontSize(12)
                .fillColor('#000000')
-               .text(`Element ${nodeIndex + 1}:`);
+               .text('Example HTML:');
             
             doc.fontSize(10)
-               .fillColor('#4B5563')
-               .text(`Location: ${selector}`, { 
-                 indent: 20,
-                 width: 450
-               });
-            
-            doc.fontSize(10)
-               .fillColor('#4B5563')
-               .text(`HTML: ${htmlSnippet.substring(0, 150)}${htmlSnippet.length > 150 ? '...' : ''}`, { 
-                 indent: 20,
-                 width: 450
-               });
-            
-            if (extraData) {
-              doc.fontSize(10)
-                 .fillColor('#4B5563')
-                 .text(`Details: ${extraData}`, { 
-                   indent: 20,
-                   width: 450
-                 });
-            }
-          });
-          
-          // Total count of affected elements
-          doc.moveDown(0.5);
-          doc.fontSize(10)
-             .fillColor('#4B5563')
-             .text(`Total affected elements: ${violation.nodes.length}${violation.nodes.length > 3 ? ` (${violation.nodes.length - 3} more not shown)` : ''}`);
+               .fillColor('#6B7280')
+               .text(node.html.substring(0, 150) + (node.html.length > 150 ? '...' : ''), 
+                 { indent: 20 });
+          }
         }
         
         doc.moveDown(1);
